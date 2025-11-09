@@ -906,6 +906,9 @@ class UWBMainWindow(QtWidgets.QMainWindow):
 
 
 if __name__ == "__main__":
+    import os
+    os.environ["QT_QPA_PLATFORM"] = "windows:darkmode=0"
+    
     app = QtWidgets.QApplication(sys.argv)
     window = UWBMainWindow()
     window.show()
