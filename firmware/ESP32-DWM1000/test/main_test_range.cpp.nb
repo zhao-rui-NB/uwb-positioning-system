@@ -1,0 +1,429 @@
+#include <Arduino.h>
+
+#include <SPI.h>
+
+#include "dw1000.h"
+#include "deca_device_api.h"
+#include "deca_regs.h"
+
+
+
+#define RNG_DELAY_MS 100
+
+static dwt_config_t config = {
+    2,               /* Channel number. */
+    DWT_PRF_64M,     /* Pulse repetition frequency. */
+    DWT_PLEN_1024,   /* Preamble length. Used in TX only. */
+    DWT_PAC64,       /* Preamble acquisition chunk size. Used in RX only. */
+    9,               /* TX preamble code. Used in TX only. */
+    9,               /* RX preamble code. Used in RX only. */
+    1,               /* 0 to use standard SFD, 1 to use non-standard SFD. */
+    DWT_BR_110K,     /* Data rate. */
+    DWT_PHRMODE_STD, /* PHY header mode. */
+    (1024 + 1 + 64 - 32) /* SFD timeout (preamble length + 1 + SFD length - PAC size). Used in RX only. */
+};
+
+static dwt_txconfig_t txconfig = {
+    0xC2,            /* PG delay. */
+    0x1f1f1f1f,      /* TX power. */
+};
+
+#define ANT_DLY 16470
+#define TX_ANT_DLY ANT_DLY
+#define RX_ANT_DLY ANT_DLY
+
+static uint8 tx_poll_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0x21, 0, 0};
+static uint8 rx_resp_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0x10, 0x02, 0, 0, 0, 0};
+static uint8 tx_final_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0x23, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+static uint8 rx_poll_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0x21, 0, 0};
+static uint8 tx_resp_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0x10, 0x02, 0, 0, 0, 0};
+static uint8 rx_final_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0x23, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+
+#define ALL_MSG_COMMON_LEN 10
+#define ALL_MSG_SN_IDX 2
+#define FINAL_MSG_POLL_TX_TS_IDX 10
+#define FINAL_MSG_RESP_RX_TS_IDX 14
+#define FINAL_MSG_FINAL_TX_TS_IDX 18
+#define FINAL_MSG_TS_LEN 4
+
+static uint8 frame_seq_nb = 0;
+#define RX_BUF_LEN 24
+static uint8 rx_buffer[RX_BUF_LEN];
+static uint32 status_reg = 0;
+
+/* UWB microsecond (uus) to device time unit (dtu, around 15.65 ps) conversion factor.
+ * 1 uus = 512 / 499.2 µs and 1 µs = 499.2 * 128 dtu. */
+#define UUS_TO_DWT_TIME 65536
+
+#define POLL_RX_TO_RESP_TX_DLY_UUS 6000//2750
+#define RESP_TX_TO_FINAL_RX_DLY_UUS 5000 //500
+#define FINAL_RX_TIMEOUT_UUS 60000
+
+#define POLL_TX_TO_RESP_RX_DLY_UUS 3000
+#define RESP_RX_TO_FINAL_TX_DLY_UUS 10000
+#define RESP_RX_TIMEOUT_UUS 60000
+
+// 40 bit timestamp, dtu(device time unit) ~15.65ps
+typedef unsigned long long uint64;
+typedef signed long long int64;
+static uint64 poll_tx_ts;
+static uint64 resp_rx_ts;
+static uint64 final_tx_ts;
+
+static uint64 poll_rx_ts;
+static uint64 resp_tx_ts;
+static uint64 final_rx_ts;
+
+static uint64 get_tx_timestamp_u64();
+static uint64 get_rx_timestamp_u64();
+static void final_msg_set_ts(uint8 *ts_field, uint64 ts);
+static float calc_rssi(dwt_rxdiag_t *rxdiag);
+
+static double tof;
+static double distance;
+
+#define SPEED_OF_LIGHT 299702547
+
+void tag_app();
+void anchor_app();
+
+
+static uint64 get_tx_timestamp_u64(){
+    uint8 ts_tab[5];
+    uint64 ts = 0;
+    int i;
+    dwt_readtxtimestamp(ts_tab);
+    for (int i = 4; i >= 0; i--){
+        ts <<= 8;
+        ts |= ts_tab[i];
+    }
+    return ts;
+}
+
+static uint64 get_rx_timestamp_u64(void){
+    uint8 ts_tab[5];
+    uint64 ts = 0;
+    int i;
+    dwt_readrxtimestamp(ts_tab);
+    for (int i = 4; i >= 0; i--){
+        ts <<= 8;
+        ts |= ts_tab[i];
+    }
+    return ts;
+}
+
+static void final_msg_get_ts(const uint8 *ts_field, uint32 *ts){
+    *ts = 0;
+    for (int i = 0; i < FINAL_MSG_TS_LEN; i++){
+        *ts += ts_field[i] << (i * 8);
+    }
+}
+
+static void final_msg_set_ts(uint8 *ts_field, uint64 ts){
+    for (int i = 0; i < FINAL_MSG_TS_LEN; i++)
+    {
+        ts_field[i] = (uint8) ts;
+        ts >>= 8;
+    }
+}
+
+static float calc_rssi(dwt_rxdiag_t *rxdiag) {
+    // user manual 4.7.2
+
+    float C = rxdiag->maxGrowthCIR; // cir_power
+    float A = 121.74f; // 113.77 for PRF 16 MHz, 121.74 for 64 MHz
+    float N = rxdiag->rxPreamCount; // rx_pacc
+
+    float rssi = 10 * log10( C * 131072.0 / (N*N) ) - A;
+
+    // 找到的修正值
+    // https://www.cnblogs.com/tuzhuke/p/12169538.html
+    // corrFac = 1.1667;
+
+    if (rssi > -88) {
+        rssi = rssi + (rssi + 88) * 1.1667;
+    }
+
+    return rssi;
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    SPI.begin();
+
+    // [esp32] ESP32 Chip ID: 0000CCFD470B65F4
+    // [esp32] ESP32 Chip ID: 0000E406470B65F4
+    uint64_t chipid64 = ESP.getEfuseMac();
+    Serial.printf("[esp32] ESP32 Chip ID: %08X%08X\n", (uint32_t)(chipid64>>32), (uint32_t)chipid64);
+    uint32_t chipid = (uint32_t)(chipid64>>32);
+
+    reset_DW1000();
+
+    Serial.println("[check] Reading DW1000 Device ID...");
+    // read dwt_readdevid 
+    // G5:LOW G6:HIGH Data is sampled on the falling (second) edge of the clock and launched on the rising (first) edge.
+    uint32 devid = dwt_readdevid();
+    Serial.print("[check] DW1000 Device ID: 0x");
+    Serial.println(devid, HEX);
+    if (devid != 0xDECA0130) {
+        Serial.println("[ERROR] Not a DW1000 device!");
+        while (1);
+    }
+
+
+    port_set_dw1000_slowrate();
+    if (dwt_initialise(DWT_LOADUCODE) == DWT_ERROR){
+        Serial.println("[ERROR] dw1000 INIT FAILED");
+        while (1){}
+    }
+    port_set_dw1000_fastrate();
+
+    dwt_configure(&config);
+    dwt_setsmarttxpower(0);
+    dwt_configuretxrf(&txconfig);
+
+    dwt_setrxantennadelay(RX_ANT_DLY);
+    dwt_settxantennadelay(TX_ANT_DLY);
+
+
+    // chip id to select role
+    switch(chipid) {
+        case 0xCCFD:
+            Serial.println("[role] setting role: anchor");
+            anchor_app();
+            break;
+
+        case 0xE406:
+            Serial.println("[role] setting role: tag");
+            tag_app();
+            break;
+
+        default:
+            Serial.println("[ERROR] chip id does not match any role");
+            while(1) {}
+    }
+
+
+
+
+}
+
+void loop() {
+    delay(1000);
+    Serial.println("Looping...");
+}
+
+
+void tag_app() {
+    Serial.println("Tag application started");
+
+    // dwt_setpreambledetecttimeout(PRE_TIMEOUT);
+
+    while (1){
+        dwt_setrxtimeout(0);
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+        while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) & (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR))){}
+        
+        if (status_reg & SYS_STATUS_RXFCG){
+            uint32 frame_len;
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG); // Clear good RX frame event
+
+            // read frame into local buffer
+            frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFL_MASK_1023;
+            if (frame_len <= RX_BUFFER_LEN){
+                dwt_readrxdata(rx_buffer, frame_len, 0);
+            }
+
+            rx_buffer[ALL_MSG_SN_IDX] = 0; // no need to check seq num
+            if (memcmp(rx_buffer, rx_poll_msg, ALL_MSG_COMMON_LEN) == 0){
+                uint32 resp_tx_time;
+                int ret;
+
+                poll_rx_ts = get_rx_timestamp_u64(); // get poll rx timestamp
+
+                resp_tx_time = (poll_rx_ts + (POLL_RX_TO_RESP_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8;
+                dwt_setdelayedtrxtime(resp_tx_time);
+
+                dwt_setrxaftertxdelay(RESP_TX_TO_FINAL_RX_DLY_UUS);
+                dwt_setrxtimeout(FINAL_RX_TIMEOUT_UUS);
+
+                tx_resp_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
+                dwt_writetxdata(sizeof(tx_resp_msg), tx_resp_msg, 0);
+                dwt_writetxfctrl(sizeof(tx_resp_msg), 0, 1);
+                ret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
+
+                if (ret == DWT_ERROR){ // start tx too late
+                    Serial.println("Error in dwt_starttx()");
+                    continue;
+                }
+
+                // wait final receive
+                while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) & (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR))){ };
+                frame_seq_nb++;
+                if (status_reg & SYS_STATUS_RXFCG){
+                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG | SYS_STATUS_TXFRS);
+
+                    frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFLEN_MASK;
+                    if (frame_len <= RX_BUF_LEN){
+                        dwt_readrxdata(rx_buffer, frame_len, 0);
+                    }
+
+                    rx_buffer[ALL_MSG_SN_IDX] = 0;
+                    if (memcmp(rx_buffer, rx_final_msg, ALL_MSG_COMMON_LEN) == 0){ // final msg recved
+                        uint32 poll_tx_ts, resp_rx_ts, final_tx_ts;
+                        uint32 poll_rx_ts_32, resp_tx_ts_32, final_rx_ts_32;
+                        double Ra, Rb, Da, Db;
+                        int64 tof_dtu;
+
+                        resp_tx_ts = get_tx_timestamp_u64();
+                        final_rx_ts = get_rx_timestamp_u64();
+
+                        /* Get timestamps embedded in the final message. */
+                        final_msg_get_ts(&rx_buffer[FINAL_MSG_POLL_TX_TS_IDX], &poll_tx_ts);
+                        final_msg_get_ts(&rx_buffer[FINAL_MSG_RESP_RX_TS_IDX], &resp_rx_ts);
+                        final_msg_get_ts(&rx_buffer[FINAL_MSG_FINAL_TX_TS_IDX], &final_tx_ts);
+
+                        /* Compute time of flight. 32-bit subtractions give correct answers even if clock has wrapped. See NOTE 12 below. */
+                        poll_rx_ts_32 = (uint32)poll_rx_ts;
+                        resp_tx_ts_32 = (uint32)resp_tx_ts;
+                        final_rx_ts_32 = (uint32)final_rx_ts;
+                        Ra = (double)(resp_rx_ts - poll_tx_ts);
+                        Rb = (double)(final_rx_ts_32 - resp_tx_ts_32);
+                        Da = (double)(final_tx_ts - resp_rx_ts);
+                        Db = (double)(resp_tx_ts_32 - poll_rx_ts_32);
+                        tof_dtu = (int64)((Ra * Rb - Da * Db) / (Ra + Rb + Da + Db));
+
+                        tof = tof_dtu * DWT_TIME_UNITS;
+                        distance = tof * SPEED_OF_LIGHT;
+                        
+                        dwt_rxdiag_t rx_diag;
+                        dwt_readdiagnostics(&rx_diag);
+                        float rssi = calc_rssi(&rx_diag);
+                        Serial.printf("DIST: %3.2f m, RSSI: %.3f dBm\n", distance, rssi);
+                        delay(1);
+                    }
+                }
+                else{
+                    
+                    Serial.printf("NO final recved, SYS_STATUS_ALL_RX_TO: %d, SYS_STATUS_ALL_RX_ERR: %d\n",
+                        (status_reg & SYS_STATUS_ALL_RX_TO) != 0,
+                        (status_reg & SYS_STATUS_ALL_RX_ERR) != 0
+                    );
+
+                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+                    dwt_rxreset();
+                }
+            }
+        }
+        else{
+
+            // Serial.printf("receive poll error, SYS_STATUS_ALL_RX_TO: %d, SYS_STATUS_ALL_RX_ERR: %d\n",
+            //     (status_reg & SYS_STATUS_ALL_RX_TO) != 0,
+            //     (status_reg & SYS_STATUS_ALL_RX_ERR) != 0
+            // );
+
+            // if (status_reg & SYS_STATUS_ALL_RX_ERR) {
+            //     Serial.printf("RX error flags: 0x%08X\n", status_reg);
+
+            //     if (status_reg & SYS_STATUS_RXPHE)   Serial.println("PHY header error");
+            //     if (status_reg & SYS_STATUS_RXFCE)   Serial.println("CRC check error");
+            //     if (status_reg & SYS_STATUS_RXRFSL)  Serial.println("Frame sync loss");
+            //     if (status_reg & SYS_STATUS_RXSFDTO) Serial.println("SFD timeout");
+            //     if (status_reg & SYS_STATUS_LDEERR)  Serial.println("LDE detect error");
+            //     if (status_reg & SYS_STATUS_AFFREJ)  Serial.println("Frame filter reject");
+            // }
+
+
+
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+            dwt_rxreset();
+            
+        }
+    }
+
+}
+
+
+void anchor_app() {
+    Serial.println("Anchor application started");
+
+    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
+    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
+    // dwt_setpreambledetecttimeout(PRE_TIMEOUT);
+
+    while(1){
+        Serial.printf("Sending poll\n");
+        
+        tx_poll_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
+        dwt_writetxdata(sizeof(tx_poll_msg), tx_poll_msg, 0);
+        dwt_writetxfctrl(sizeof(tx_poll_msg), 0, 1);
+
+        dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
+
+        while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) & (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR))){};
+        frame_seq_nb++;
+
+        if (status_reg & SYS_STATUS_RXFCG){
+            uint32 frame_len;
+
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG | SYS_STATUS_TXFRS); // frame check good and frame sent
+
+            frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFLEN_MASK;
+            if (frame_len <= RX_BUF_LEN){
+                dwt_readrxdata(rx_buffer, frame_len, 0);
+            }
+
+            rx_buffer[ALL_MSG_SN_IDX] = 0;
+            if (memcmp(rx_buffer, rx_resp_msg, ALL_MSG_COMMON_LEN) == 0){
+                uint32 final_tx_time;
+                int ret;
+
+                poll_tx_ts = get_tx_timestamp_u64();
+                resp_rx_ts = get_rx_timestamp_u64();
+
+                final_tx_time = (resp_rx_ts + (RESP_RX_TO_FINAL_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8;
+                dwt_setdelayedtrxtime(final_tx_time);
+
+                // Final TX timestamp is the transmission time, we plus the TX antenna delay
+                final_tx_ts = (((uint64)(final_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
+
+                // Write all timestamps in the final message
+                final_msg_set_ts(&tx_final_msg[FINAL_MSG_POLL_TX_TS_IDX], poll_tx_ts);
+                final_msg_set_ts(&tx_final_msg[FINAL_MSG_RESP_RX_TS_IDX], resp_rx_ts);
+                final_msg_set_ts(&tx_final_msg[FINAL_MSG_FINAL_TX_TS_IDX], final_tx_ts);
+
+                // Write and send final message
+                tx_final_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
+                dwt_writetxdata(sizeof(tx_final_msg), tx_final_msg, 0); /* Zero offset in TX buffer. */
+                dwt_writetxfctrl(sizeof(tx_final_msg), 0, 1); /* Zero offset in TX buffer, ranging. */
+                ret = dwt_starttx(DWT_START_TX_DELAYED);
+
+                if (ret == DWT_SUCCESS){ // start tx to late
+                    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS)){};
+                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
+                    frame_seq_nb++;
+
+                    Serial.printf("Final send success %d\n", frame_seq_nb);
+                }
+                else{
+                    Serial.printf("Error in dwt_starttx()\n");
+                }
+            }
+        }
+        else{
+            Serial.printf("No response\n");
+            Serial.printf("SYS_STATUS_ALL_RX_TO: %d\n", (status_reg & SYS_STATUS_ALL_RX_TO) != 0);
+            Serial.printf("SYS_STATUS_ALL_RX_ERR: %d\n", (status_reg & SYS_STATUS_ALL_RX_ERR) != 0);
+
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+            dwt_rxreset();
+        }
+
+        Sleep(RNG_DELAY_MS);
+    }
+
+}
